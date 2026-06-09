@@ -1,0 +1,8 @@
+brian2>=2.10.1
+numpy>=2.0.0
+scipy>=1.10.0
+matplotlib>=3.5.0
+pygame>=2.0.0
+flask>=3.0.0
+flask-socketio>=5.3.0
+torch>=2.0.0
