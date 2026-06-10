@@ -10,12 +10,18 @@ from brain.connectome_loader import load_or_generate_connectome
 prefs.codegen.target = 'numpy'
 
 class FlyBrainSNN:
-    def __init__(self, use_noise=True):
+    def __init__(self, use_noise=True, synapse_counts=None):
         """
         Initializes the 1,000-neuron SNN representing the fly brain.
         - 100 Sensory neurons (input)
         - 800 Recurrent neurons (brain)
         - 100 Motor neurons (output)
+
+        :param synapse_counts: Optional dict mapping synapse names
+            ('S_in', 'S_direct', 'S_out') to exact connection counts.
+            When provided (e.g. from a saved weights file), random
+            connections are created to match those counts exactly,
+            avoiding shape mismatches from p-value or seed changes.
         """
         start_scope()
         
@@ -41,30 +47,46 @@ class FlyBrainSNN:
         self.motor.I_inj = 0 * nA
         
         # 3. Connect populations
-        # Sensory -> Recurrent (8% connection probability, random weight)
+        # Sensory -> Recurrent
         self.S_in = Synapses(self.sensory, self.recurrent, model='w : 1', on_pre='v_post += w * mV')
-        self.S_in.connect(p=0.08)
-        self.S_in.w = '0.5 + rand() * 1.5'  # 0.5 to 2.0 mV EPSP
+        if synapse_counts and 'S_in' in synapse_counts:
+            self._connect_n(self.S_in, 100, 800, synapse_counts['S_in'])
+        else:
+            self.S_in.connect(p=0.15)
+        self.S_in.w = '0.5 + rand() * 1.5'
+
+        # Sensory -> Motor (direct skip; keeps motor firing when recurrent is quiet)
+        # Small weights (0.1–0.3 mV) provide baseline drive without dominating recurrent output
+        self.S_direct = Synapses(self.sensory, self.motor, model='w : 1', on_pre='v_post += w * mV')
+        if synapse_counts and 'S_direct' in synapse_counts:
+            self._connect_n(self.S_direct, 100, 100, synapse_counts['S_direct'])
+        else:
+            self.S_direct.connect(p=0.30)
+        self.S_direct.w = '0.1 + rand() * 0.2'
         
-        # Recurrent -> Recurrent (Connected via the small-world fly connectome)
+        # Recurrent -> Recurrent (small-world connectome)
         sources, targets, weights = load_or_generate_connectome()
         self.S_rec = Synapses(self.recurrent, self.recurrent, model='w : 1', on_pre='v_post += w * mV')
         self.S_rec.connect(i=sources, j=targets)
-        self.S_rec.w = weights  # Synaptic conductances scale defined in connectome loader
+        self.S_rec.w = weights
         
-        # Recurrent -> Motor (8% connection probability, random weight)
+        # Recurrent -> Motor (increased to 50% to prevent motor layer silence)
         self.S_out = Synapses(self.recurrent, self.motor, model='w : 1', on_pre='v_post += w * mV')
-        self.S_out.connect(p=0.08)
-        self.S_out.w = '0.5 + rand() * 1.5'  # 0.5 to 2.0 mV EPSP
+        if synapse_counts and 'S_out' in synapse_counts:
+            self._connect_n(self.S_out, 800, 100, synapse_counts['S_out'])
+        else:
+            self.S_out.connect(p=0.50)
+        self.S_out.w = '0.5 + rand() * 1.5'
         
-        # Store initial weights and set maximum weight limits to prevent saturation
         self.S_in_initial = np.array(self.S_in.w)
         self.S_rec_initial = np.array(self.S_rec.w)
         self.S_out_initial = np.array(self.S_out.w)
+        self.S_direct_initial = np.array(self.S_direct.w)
         
         self.max_in_w = self.S_in_initial * 1.5
         self.max_rec_w = self.S_rec_initial * 1.02
         self.max_out_w = self.S_out_initial * 1.5
+        self.max_direct_w = self.S_direct_initial * 1.5
         
         # 4. Set up Monitors
         self.spike_mon_sensory = SpikeMonitor(self.sensory)
@@ -84,12 +106,32 @@ class FlyBrainSNN:
         # 6. Initialize Network
         self.net = Network(
             self.sensory, self.recurrent, self.motor,
-            self.S_in, self.S_rec, self.S_out,
+            self.S_in, self.S_direct, self.S_rec, self.S_out,
             self.spike_mon_sensory, self.spike_mon_recurrent, self.spike_mon_motor,
             self.state_mon_rec
         )
         if self.noise:
             self.net.add(self.noise)
+
+        self._motor_firing_running_avg = 0.0
+        self._motor_low_firing_streak = 0
+        self._motor_episode_steps = 0
+        self._motor_collapse = False
+
+    @staticmethod
+    def _connect_n(synapse_group, n_pre, n_post, n_connections):
+        """Create exactly *n_connections* random connections for a Synapse group.
+
+        This is used when restoring from a saved weights file whose synapse
+        count may differ from what ``connect(p=...)`` would produce (e.g.
+        because the probability was changed after the checkpoint was saved).
+        """
+        max_pairs = n_pre * n_post
+        n_connections = min(n_connections, max_pairs)
+        selected = np.sort(np.random.choice(max_pairs, size=n_connections, replace=False))
+        i_idx = selected // n_post
+        j_idx = selected % n_post
+        synapse_group.connect(i=i_idx, j=j_idx)
             
     def run(self, duration):
         """
@@ -129,35 +171,102 @@ class FlyBrainSNN:
         """
         return self.get_spikes_in_window(self.spike_mon_motor, 100, t_start, t_end)
 
-    def update_weights(self, free_energy, t_start, t_end, learning_rate=0.01):
+    def reset_episode_diagnostics(self):
+        """Reset motor firing-rate tracking at the start of each episode."""
+        self._motor_firing_running_avg = 0.0
+        self._motor_low_firing_streak = 0
+        self._motor_episode_steps = 0
+        self._motor_collapse = False
+
+    def _inject_motor_boost(self, boost_current=0.5 * nA, num_neurons=20, duration=10 * ms):
+        """Inject a brief current pulse into random motor neurons to kickstart activity."""
+        indices = np.random.choice(100, size=min(num_neurons, 100), replace=False)
+        self.motor.I_inj[indices] = boost_current
+        self.net.run(duration)
+        self.motor.I_inj = 0 * nA
+
+    def after_simulation_step(self, t_start, t_end):
+        """
+        Post-step motor diagnostics: boost silent motor layers and detect collapse.
+
+        If total motor spikes in the step window are below 10, inject 0.5 nA into
+        20 random motor neurons for 10 ms. Tracks a running average of the fraction
+        of motor neurons that fire each step; aborts after 3 consecutive steps with
+        running average below 5%.
+
+        Returns a dict with motor_spikes, motor_firing_pct, motor_firing_running_avg,
+        motor_collapse, and boosted.
+        """
+        motor_spikes = self.get_motor_spikes_in_window(t_start, t_end)
+        motor_total = int(np.sum(motor_spikes))
+        boosted = False
+
+        if motor_total < 10:
+            print(
+                f"[MotorBoost] Motor spike count {motor_total} < 10 — "
+                f"injecting 0.5 nA into 20 neurons for 10 ms"
+            )
+            self._inject_motor_boost()
+            boosted = True
+
+        motor_firing_pct = float((np.sum(motor_spikes > 0) / len(motor_spikes)) * 100)
+
+        self._motor_episode_steps += 1
+        n = self._motor_episode_steps
+        self._motor_firing_running_avg += (motor_firing_pct - self._motor_firing_running_avg) / n
+
+        if self._motor_firing_running_avg < 5.0:
+            self._motor_low_firing_streak += 1
+        else:
+            self._motor_low_firing_streak = 0
+
+        motor_collapse = self._motor_low_firing_streak >= 3
+        if motor_collapse:
+            self._motor_collapse = True
+            print(
+                "[MotorCollapse] motor collapse — running average firing rate below 5% "
+                f"for {self._motor_low_firing_streak} consecutive steps "
+                f"(avg={self._motor_firing_running_avg:.1f}%)"
+            )
+
+        return {
+            'motor_spikes': motor_spikes,
+            'motor_total': motor_total,
+            'motor_firing_pct': motor_firing_pct,
+            'motor_firing_running_avg': self._motor_firing_running_avg,
+            'motor_collapse': motor_collapse,
+            'boosted': boosted,
+        }
+
+    def update_weights(self, free_energy, t_start, t_end, learning_rate=0.01, verbose=False):
         """
         Updates synaptic weights in the network using the FEP-modulated Hebbian learning rule.
         """
         from bridge.learning_rules import update_weights
         
-        # Get spike counts for each population in the last step
         sensory_spikes = self.get_spikes_in_window(self.spike_mon_sensory, 100, t_start, t_end)
         recurrent_spikes = self.get_spikes_in_window(self.spike_mon_recurrent, 800, t_start, t_end)
         motor_spikes = self.get_spikes_in_window(self.spike_mon_motor, 100, t_start, t_end)
         
-        print(f"  [Learning] Spikes - Sensory: {np.sum(sensory_spikes)} | Recurrent: {np.sum(recurrent_spikes)} | Motor: {np.sum(motor_spikes)}")
-        print(f"  [Learning] S_in.w mean: {np.mean(self.S_in.w):.4f} | S_rec.w mean: {np.mean(self.S_rec.w):.4f} | S_out.w mean: {np.mean(self.S_out.w):.4f}")
-        
-        # 1. Update Sensory -> Recurrent weights
         pre_in = sensory_spikes[self.S_in.i]
         post_in = recurrent_spikes[self.S_in.j]
         self.S_in.w = update_weights(pre_in, post_in, self.S_in.w, free_energy, learning_rate, max_weight=self.max_in_w)
+
+        pre_direct = sensory_spikes[self.S_direct.i]
+        post_direct = motor_spikes[self.S_direct.j]
+        self.S_direct.w = update_weights(
+            pre_direct, post_direct, self.S_direct.w, free_energy, learning_rate, max_weight=self.max_direct_w
+        )
         
-        # 2. Update Recurrent -> Recurrent weights
-        # pre_rec = recurrent_spikes[self.S_rec.i]
-        # post_rec = recurrent_spikes[self.S_rec.j]
-        # self.S_rec.w = update_weights(pre_rec, post_rec, self.S_rec.w, free_energy, learning_rate, max_weight=self.max_rec_w)
-        
-        # 3. Update Recurrent -> Motor weights
         pre_out = recurrent_spikes[self.S_out.i]
         post_out = motor_spikes[self.S_out.j]
         self.S_out.w = update_weights(pre_out, post_out, self.S_out.w, free_energy, learning_rate, max_weight=self.max_out_w)
-        print(f"  [Learning] Updated means - S_in.w: {np.mean(self.S_in.w):.4f} | S_rec.w: {np.mean(self.S_rec.w):.4f} | S_out.w: {np.mean(self.S_out.w):.4f}")
+
+        if verbose:
+            print(
+                f"  [Learning] Sensory: {np.sum(sensory_spikes)} | "
+                f"Recurrent: {np.sum(recurrent_spikes)} | Motor: {np.sum(motor_spikes)}"
+            )
 
     def reset_monitors(self):
         """

@@ -40,33 +40,48 @@ gen_model = None
 def load_or_init_components():
     global snn, encoder, decoder, gen_model
     
+    weights_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'trained_weights.npz'))
+
+    if not os.path.exists(weights_path):
+        print(
+            "[Error] No trained weights found. "
+            "Run train.py first to initialize."
+        )
+        return False
+
     # 1. Initialize models
     snn = FlyBrainSNN(use_noise=True)
     encoder = Encoder()
     decoder = Decoder()
     gen_model = GenerativeModel()
     
-    # 2. Try to load weights from file
-    weights_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'trained_weights.npz'))
-    if os.path.exists(weights_path):
-        try:
-            print(f"Loading trained weights from: {weights_path}")
-            data = np.load(weights_path)
-            snn.S_in.w = data['S_in_w']
-            snn.S_rec.w = data['S_rec_w']
-            snn.S_out.w = data['S_out_w']
-            decoder.W_out = data['decoder_W_out']
-            decoder.W_reward = data['decoder_W_reward']
-            decoder.W_action = data['decoder_W_action']
-            encoder.W = data['encoder_W']
-            encoder.W_intention = data['encoder_W_intention']
-            print("Successfully loaded trained weights!")
-            return True
-        except Exception as e:
-            print(f"Failed to load weights: {e}. Falling back to random initialization.")
-    else:
-        print("No pre-trained weights found. Starting with random weights.")
-    return False
+    # 2. Load weights — no random fallback
+    try:
+        print(f"Loading trained weights from: {weights_path}")
+        data = np.load(weights_path)
+        snn.S_in.w  = data['S_in_w']
+        snn.S_rec.w = data['S_rec_w']
+        snn.S_out.w = data['S_out_w']
+        if 'S_direct_w' in data:
+            snn.S_direct.w = data['S_direct_w']
+        decoder.W_out    = data['decoder_W_out']
+        decoder.W_reward = data['decoder_W_reward']
+        decoder.W_action = data['decoder_W_action']
+        if 'decoder_W_forward' in data:
+            decoder.W_forward = data['decoder_W_forward']
+        if 'decoder_W_reward_forward' in data:
+            decoder.W_reward_forward = data['decoder_W_reward_forward']
+        encoder.W           = data['encoder_W']
+        encoder.W_intention = data['encoder_W_intention']
+        print("Successfully loaded trained weights!")
+        return True
+    except Exception as e:
+        print(
+            f"[Error] Failed to load weights from '{weights_path}': {e}\n"
+            "Fix or delete the file, then re-run train.py."
+        )
+        snn = encoder = decoder = gen_model = None
+        return False
 
 @app.route('/')
 def index():
@@ -126,7 +141,7 @@ def simulation_worker():
         
         # 1. Action selection via Active Inference
         # Uses Softmax over expected free energy (EFE)
-        action = select_action(snn, state, env.get_actions(), encoder, decoder, gen_model)
+        action, _ = select_action(snn, state, env.get_actions(), encoder, decoder, gen_model)
         
         # 2. Execute step
         next_state, reward, done = env.step(action)
@@ -227,14 +242,15 @@ def handle_toggle_train(data):
 
 @socketio.on('reset_weights')
 def handle_reset_weights():
-    global snn, encoder, decoder, gen_model
-    # Re-initialize to random weights
-    snn = FlyBrainSNN(use_noise=True)
-    encoder = Encoder()
-    decoder = Decoder()
-    gen_model = GenerativeModel()
-    print("SNN weights and decoder reset to random initialization.")
-    socketio.emit('weights_reset', {'status': 'success'})
+    """Reload from the saved checkpoint — random init is never allowed."""
+    loaded = load_or_init_components()
+    socketio.emit(
+        'weights_reset',
+        {
+            'status': 'success' if loaded else 'failed',
+            'message': '' if loaded else 'No trained weights found. Run train.py first.',
+        },
+    )
 
 @socketio.on('reload_trained')
 def handle_reload_trained():

@@ -21,6 +21,13 @@ class Renderer:
     COLOR_TEXT = (205, 214, 244)     # Light gray text
     COLOR_TEXT_DIM = (147, 153, 178) # Muted text
 
+    # Neural heatmap population colors
+    COLOR_SENSORY = (166, 227, 161)      # Green  (#a6e3a1)
+    COLOR_RECURRENT = (137, 180, 250)    # Blue   (#89b4fa)
+    COLOR_MOTOR = (243, 139, 168)        # Red    (#f38ba8)
+    COLOR_NEURON_DIM = (20, 20, 30)      # Dim background for silent neurons
+    COLOR_OVERLAY_BG = (17, 17, 27, 180) # Semi-transparent overlay background
+
     def __init__(self, env, cell_size=50):
         self.env = env
         self.cell_size = cell_size
@@ -29,10 +36,10 @@ class Renderer:
         # Dimensions
         self.grid_offset_x = 40
         self.grid_offset_y = 50
-        self.panel_width = 300
+        self.panel_width = 400
         
         self.width = self.grid_pixel_size + self.grid_offset_x * 2 + self.panel_width
-        self.height = self.grid_pixel_size + self.grid_offset_y * 2
+        self.height = max(self.grid_pixel_size + self.grid_offset_y * 2, 700)
         
         pygame.init()
         pygame.display.set_caption("NeuroSpark Stage 1: Active Inference Grid World")
@@ -60,6 +67,9 @@ class Renderer:
         self.trail = [tuple(env.agent_pos)]
         self.collision_flash = 0 # frame count for red flash effect on collision
 
+        # SNN neural data (updated each step via update_snn_data)
+        self.snn_data = None  # dict or None
+
     def get_font(self, names, size, bold=False):
         for name in names:
             try:
@@ -67,6 +77,22 @@ class Renderer:
             except:
                 pass
         return pygame.font.Font(None, size)
+
+    def update_snn_data(self, data):
+        """
+        Accept per-step SNN diagnostic data for visualization.
+
+        :param data: dict with keys:
+            - sensory_spikes:  np.ndarray (100,) – spike counts per sensory neuron
+            - recurrent_spikes: np.ndarray (800,) – spike counts per recurrent neuron
+            - motor_spikes:    np.ndarray (100,) – spike counts per motor neuron
+            - motor_total:     int   – total motor spike count
+            - action_name:     str   – current action (e.g. "RIGHT")
+            - free_energy:     float – current free energy value
+            - motor_firing_pct: float – percentage of motor neurons that fired
+            - step:            int   – current step number
+        """
+        self.snn_data = data
 
     def draw_glowing_circle(self, surface, color_glow, center, radius, pulse_val=0.0):
         # Draw soft translucent outer rings
@@ -240,6 +266,9 @@ class Renderer:
         # Draw agent core/eye direction based on goal or just center
         pygame.draw.circle(self.screen, (255, 255, 255), agent_center, 4)
 
+        # 6b. Draw on-grid SNN overlay (motor spikes + action)
+        self._draw_grid_overlay()
+
         # 7. Draw Side Panel & HUD
         panel_rect = pygame.Rect(self.width - self.panel_width, 0, self.panel_width, self.height)
         pygame.draw.rect(self.screen, self.COLOR_PANEL, panel_rect)
@@ -344,3 +373,121 @@ class Renderer:
         obs_surf2 = self.font_mono.render(f"Goal: {obs_str2}", True, self.COLOR_TEXT_DIM)
         self.screen.blit(obs_surf1, (self.width - self.panel_width + 25, hud_obs_y + 24))
         self.screen.blit(obs_surf2, (self.width - self.panel_width + 25, hud_obs_y + 42))
+
+        # 11. Draw Neural Activity Heatmap (if SNN data available)
+        self._draw_neural_heatmap()
+
+    # ------------------------------------------------------------------
+    # SNN Visualization helpers
+    # ------------------------------------------------------------------
+
+    def _draw_grid_overlay(self):
+        """Render motor spike count and current action on the grid area (semi-transparent)."""
+        if self.snn_data is None:
+            return
+
+        d = self.snn_data
+        motor_total = d.get('motor_total', 0)
+        action_name = d.get('action_name', '—')
+        step = d.get('step', 0)
+
+        # Build overlay surface
+        overlay_w, overlay_h = 220, 50
+        overlay = pygame.Surface((overlay_w, overlay_h), pygame.SRCALPHA)
+        overlay.fill(self.COLOR_OVERLAY_BG)
+
+        # Render text onto overlay
+        line1 = f"Step {step:03d}  MOTOR: {motor_total}"
+        line2 = f"Action: {action_name}"
+        surf1 = self.font_mono.render(line1, True, self.COLOR_TEXT)
+        surf2 = self.font_mono.render(line2, True, self.COLOR_FOV)
+        overlay.blit(surf1, (8, 6))
+        overlay.blit(surf2, (8, 26))
+
+        # Blit onto screen at top-left of grid area
+        self.screen.blit(overlay, (self.grid_offset_x + 4, self.grid_offset_y + 4))
+
+    def _draw_neural_heatmap(self):
+        """Draw the neuron firing heatmap in the side panel, color-coded by population."""
+        if self.snn_data is None:
+            return
+
+        d = self.snn_data
+        sensory = np.asarray(d.get('sensory_spikes', []))
+        recurrent = np.asarray(d.get('recurrent_spikes', []))
+        motor = np.asarray(d.get('motor_spikes', []))
+
+        if len(sensory) == 0 and len(recurrent) == 0 and len(motor) == 0:
+            return
+
+        panel_x = self.width - self.panel_width + 25
+        heatmap_y = 530  # start below existing HUD elements
+
+        # Section title
+        title = self.font_subtitle.render("Neural Activity Heatmap", True, self.COLOR_AGENT)
+        self.screen.blit(title, (panel_x, heatmap_y))
+        heatmap_y += 22
+
+        cell_px = 3   # pixel size per neuron cell
+        gap = 4       # gap between population blocks
+
+        # Draw each population as a 10-column grid
+        cols = 10
+        populations = [
+            ("Sensory",   sensory,   self.COLOR_SENSORY,   100),
+            ("Recurrent", recurrent, self.COLOR_RECURRENT, 800),
+            ("Motor",     motor,     self.COLOR_MOTOR,     100),
+        ]
+
+        for pop_name, spikes, color, expected_size in populations:
+            if len(spikes) != expected_size:
+                continue
+
+            rows = expected_size // cols
+            block_w = cols * cell_px
+            block_h = rows * cell_px
+
+            # Population label
+            label = self.font_mono.render(pop_name, True, color)
+            self.screen.blit(label, (panel_x, heatmap_y))
+            heatmap_y += 16
+
+            # Draw neuron grid
+            max_spike = max(float(np.max(spikes)), 1.0)
+            for idx in range(expected_size):
+                r = idx // cols
+                c = idx % cols
+                x = panel_x + c * cell_px
+                y = heatmap_y + r * cell_px
+
+                if spikes[idx] > 0:
+                    # Brightness proportional to spike count
+                    intensity = min(spikes[idx] / max_spike, 1.0)
+                    # Lerp from dim to full color
+                    cr = int(self.COLOR_NEURON_DIM[0] + (color[0] - self.COLOR_NEURON_DIM[0]) * intensity)
+                    cg = int(self.COLOR_NEURON_DIM[1] + (color[1] - self.COLOR_NEURON_DIM[1]) * intensity)
+                    cb = int(self.COLOR_NEURON_DIM[2] + (color[2] - self.COLOR_NEURON_DIM[2]) * intensity)
+                    cell_color = (cr, cg, cb)
+                else:
+                    cell_color = self.COLOR_NEURON_DIM
+
+                pygame.draw.rect(self.screen, cell_color, (x, y, cell_px, cell_px))
+
+            # Draw border around the block
+            pygame.draw.rect(self.screen, self.COLOR_GRID, (panel_x, heatmap_y, block_w, block_h), 1)
+            heatmap_y += block_h + gap
+
+        # SNN summary stats below heatmap
+        heatmap_y += 4
+        stats = [
+            ("Motor Spikes:", f"{d.get('motor_total', 0)}"),
+            ("Firing %:",     f"{d.get('motor_firing_pct', 0.0):.1f}%"),
+            ("Free Energy:",  f"{d.get('free_energy', 0.0):.3f}"),
+            ("Action:",       f"{d.get('action_name', '—')}"),
+        ]
+        for label, val in stats:
+            lbl_surf = self.font_body.render(label, True, self.COLOR_TEXT_DIM)
+            val_surf = self.font_mono.render(val, True, self.COLOR_TEXT)
+            self.screen.blit(lbl_surf, (panel_x, heatmap_y))
+            self.screen.blit(val_surf, (panel_x + 120, heatmap_y))
+            heatmap_y += 20

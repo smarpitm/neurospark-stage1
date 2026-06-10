@@ -47,7 +47,7 @@ def run_and_record():
 
     for step in range(MAX_STEPS):
         # ---- Select action via Active Inference ----
-        action = select_action(snn, state, env.get_actions(), encoder, decoder, gen_model)
+        action, _ = select_action(snn, state, env.get_actions(), encoder, decoder, gen_model)
 
         # ---- Execute action in the GridWorld ----
         next_state, reward, done = env.step(action)
