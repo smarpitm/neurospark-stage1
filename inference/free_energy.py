@@ -42,3 +42,11 @@ def compute_expected_free_energy(predicted_state, preferred_state, predicted_rew
     pragmatic_error = compute_prediction_error(predicted_state, preferred_state)
     reward_error = (predicted_reward - preferred_reward) ** 2
     return pragmatic_error + reward_weight * reward_error
+
+def annealed_epsilon(episode):
+    """
+    Returns an epsilon value for epsilon-greedy exploration that decays over episodes.
+    Starts at 0.30 and decays to a minimum of 0.05.
+    """
+    return float(max(0.05, 0.30 * np.exp(-episode / 10.0)))
+

@@ -153,6 +153,7 @@ class TestActionSelectionBasic(unittest.TestCase):
             decoder=_ScenarioDecoder(),
             generative_model=gen_model,
             verbose=False,
+            epsilon=0.0,
         )
         self.assertEqual(best_action, 2)
 
@@ -193,6 +194,7 @@ class TestMotorSilenceFallback(unittest.TestCase):
             decoder=decoder,
             generative_model=gen_model,
             verbose=False,
+            epsilon=0.0,
         )
 
         efe_values = plan_info['efe']
@@ -211,9 +213,9 @@ class TestEFEDiscrimination(unittest.TestCase):
     """
     (b) After pre-training the forward model on ~10 simulated 'episodes' worth of
     random transitions, EFE spread across valid actions should be meaningfully
-    non-zero (> 0.1) for at least 80% of test states.
+    non-zero (> 0.2) for at least 80% of test states.
 
-    Note: the threshold is 0.1 rather than the intuitive 0.5 because a zero-spike
+    Note: the threshold is 0.2 rather than the intuitive 0.5 because a zero-spike
     SNN routes all planning through the analytical forward model whose output scale
     is bounded by the decoder weight magnitudes.  What matters is that actions are
     discriminated at all — the motor silence fallback test already proves the spread
@@ -260,16 +262,17 @@ class TestEFEDiscrimination(unittest.TestCase):
                 decoder=decoder,
                 generative_model=gen_model,
                 verbose=False,
+                epsilon=0.0,
             )
             efe_spread = plan_info['efe_spread']
-            if efe_spread > 0.1:
+            if efe_spread > 0.2:
                 discriminating += 1
 
         pct = discriminating / len(test_states)
         self.assertGreaterEqual(
             pct, 0.80,
             msg=(
-                f"EFE spread > 0.1 in only {discriminating}/{len(test_states)} "
+                f"EFE spread > 0.2 in only {discriminating}/{len(test_states)} "
                 f"({pct*100:.1f}%) states — expected ≥ 80%. "
                 "The forward model may not be learning action-specific transitions."
             ),
@@ -320,6 +323,7 @@ class TestGoalReach(unittest.TestCase):
                 generative_model=gen_model,
                 reward_weight=reward_weight,
                 verbose=False,
+                epsilon=0.0,
             )
             next_state, reward, done = env.step(action)
             # Online forward-model update
@@ -379,6 +383,37 @@ class TestGoalReach(unittest.TestCase):
                 "The forward model may not be learning a useful navigation policy."
             ),
         )
+
+
+class TestEpsilonGreedyExplores(unittest.TestCase):
+    def test_epsilon_greedy_explores(self):
+        """Verify that with epsilon=1.0, select_action returns each of 4 actions roughly equally over 400 calls (chi-square uniformity, p > 0.01)"""
+        snn = _MockSNNZeroSpikes()
+        encoder = _MockEncoder()
+        decoder = Decoder()
+        gen_model = GenerativeModel()
+        
+        possible_actions = [0, 1, 2, 3]
+        state = np.zeros(11, dtype=np.float32)
+        
+        counts = {a: 0 for a in possible_actions}
+        np.random.seed(42)
+        for _ in range(400):
+            action, _ = select_action(
+                snn=snn,
+                current_state=state,
+                possible_actions=possible_actions,
+                encoder=encoder,
+                decoder=decoder,
+                generative_model=gen_model,
+                verbose=False,
+                epsilon=1.0
+            )
+            counts[action] += 1
+            
+        expected = 100
+        chi2 = sum(((count - expected) ** 2) / expected for count in counts.values())
+        self.assertLess(chi2, 11.345, f"Actions not uniform: {counts}, chi2: {chi2} >= 11.345 (p=0.01)")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

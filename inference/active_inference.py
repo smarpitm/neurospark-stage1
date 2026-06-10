@@ -18,7 +18,7 @@ def select_action(
     beta=15.0,
     reward_weight=3.0,
     verbose=True,
-    epsilon=EPSILON,
+    epsilon=0.0,
 ):
     """
     Select action via Expected Free Energy (forward model + SNN imagination).
@@ -34,6 +34,23 @@ def select_action(
     """
     import numpy as np
     from inference.free_energy import compute_expected_free_energy
+
+    if np.random.rand() < epsilon:
+        selected_action = int(np.random.choice(possible_actions))
+        plan_info = {
+            'actions': [int(a) for a in possible_actions],
+            'action_names': [ACTION_NAMES[a] for a in possible_actions],
+            'efe': [],
+            'scores': [],
+            'policy_logits': [],
+            'random': True,
+            'efe_spread': 0.0,
+            'selected': selected_action,
+            'selected_name': ACTION_NAMES[selected_action],
+        }
+        if verbose:
+            print(f"  [Plan] Pick: {ACTION_NAMES[selected_action]} (epsilon-random early exit)")
+        return selected_action, plan_info
 
     preferred_state = generative_model.get_preferred_state()
     preferred_reward = generative_model.get_preferred_reward()
@@ -87,13 +104,13 @@ def select_action(
 
     efe_spread = float(np.max(efe_arr) - np.min(efe_arr))
 
-    # ── Epsilon-greedy exploration ───────────────────────────────────────
+    # ── Flat EFE exploration ───────────────────────────────────────
     is_random = False
-    if np.random.rand() < epsilon:
-        selected_action = int(np.random.choice(possible_actions))
-        is_random = True
-    elif efe_spread < 0.02:
+    if efe_spread < 0.02:
         # EFE is flat — pick uniformly at random (no signal to exploit)
+        state_norm = float(np.linalg.norm(current_state))
+        raw_efe = [round(float(v), 4) for v in efe_arr]
+        print(f"  [PlanningWarn] Flat EFE spread ({efe_spread:.4f} < 0.02). State norm: {state_norm:.4f}. Raw EFE: {raw_efe}")
         selected_action = int(np.random.choice(possible_actions))
         is_random = True
     else:
@@ -118,10 +135,10 @@ def select_action(
     if verbose:
         efe_dict = dict(zip(plan_info['action_names'], [round(v, 4) for v in plan_info['efe']]))
         scores_dict = dict(zip(plan_info['action_names'], [round(v, 4) for v in plan_info['scores']]))
-        tag = " (ε-random)" if is_random else ""
+        tag = " (epsilon-random)" if is_random else ""
         print(
             f"  [Plan] EFE: {list(efe_dict.values())} | "
-            f"Score(−EFE): {list(scores_dict.values())} | "
+            f"Score(-EFE): {list(scores_dict.values())} | "
             f"Pick: {ACTION_NAMES[selected_action]}{tag}"
         )
 
