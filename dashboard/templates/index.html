@@ -1,0 +1,170 @@
+<!-- dashboard/templates/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NeuroSpark SNN Active Inference Dashboard</title>
+    <!-- Favicon -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+    <!-- Style Sheet -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <!-- Socket.IO -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <header>
+        <div class="logo-container">
+            <div class="logo-icon">🧠</div>
+            <div>
+                <h1>NeuroSpark</h1>
+                <div style="display: flex; gap: 6px; align-items: center; margin-top: 2px;">
+                    <span class="header-tag">Digital Twin</span>
+                    <span style="font-size: 12px; color: var(--text-muted);">Stage 1 Connectome SNN</span>
+                </div>
+            </div>
+        </div>
+        <div class="status-badge">
+            <span id="socket-status-dot" class="status-dot"></span>
+            <span id="socket-status-text">Disconnected</span>
+        </div>
+    </header>
+
+    <main>
+        <!-- Sidebar Controls -->
+        <div class="sidebar">
+            <div class="card glow-blue">
+                <div class="card-title">
+                    <span>Engine Controls</span>
+                    <span id="run-status-indicator" style="font-size: 11px; font-weight: 600; color: var(--text-muted);">IDLE</span>
+                </div>
+                
+                <div class="btn-group">
+                    <button id="btn-start" class="btn btn-primary">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg> Run Episode
+                    </button>
+                    <button id="btn-pause" class="btn btn-secondary" disabled>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg> Pause
+                    </button>
+                    <button id="btn-stop" class="btn btn-danger" disabled>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h12v12H6z"/></svg> Stop
+                    </button>
+                </div>
+
+                <div style="margin-top: 24px; border-top: 1px solid rgba(255,255,255,0.04); padding-top: 20px;">
+                    <div class="control-row">
+                        <div class="control-label">
+                            <span>Step Speed</span>
+                            <span id="speed-val">200ms</span>
+                        </div>
+                        <div class="slider-container">
+                            <input id="speed-slider" type="range" min="50" max="1000" step="50" value="200">
+                        </div>
+                    </div>
+
+                    <div class="switch-container">
+                        <div>
+                            <div style="font-size: 14px; font-weight: 500;">Modulated Learning</div>
+                            <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">Update SNN + Decoder weights</div>
+                        </div>
+                        <label class="switch">
+                            <input id="train-switch" type="checkbox">
+                            <span class="switch-slider"></span>
+                        </label>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">Synaptic Weights</div>
+                <div class="btn-group" style="gap: 10px;">
+                    <button id="btn-reload-weights" class="btn btn-secondary" style="font-size: 13px;">
+                        ♻️ Load Trained Weights
+                    </button>
+                    <button id="btn-reset-weights" class="btn btn-secondary btn-danger" style="font-size: 13px; background: rgba(244,63,94,0.05);">
+                        ⚠️ Reset to Random
+                    </button>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">Telemetry Info</div>
+                <div class="telemetry-grid">
+                    <div class="telemetry-item">
+                        <div class="telemetry-label">Step</div>
+                        <div id="telemetry-step" class="telemetry-value">0</div>
+                    </div>
+                    <div class="telemetry-item">
+                        <div class="telemetry-label">Agent Position</div>
+                        <div id="telemetry-pos" class="telemetry-value">(0, 0)</div>
+                    </div>
+                    <div class="telemetry-item">
+                        <div class="telemetry-label">Chosen Action</div>
+                        <div id="telemetry-action" class="telemetry-value">-</div>
+                    </div>
+                    <div class="telemetry-item">
+                        <div class="telemetry-label">Step Reward</div>
+                        <div id="telemetry-reward" class="telemetry-value">0.00</div>
+                    </div>
+                    <div class="telemetry-item">
+                        <div class="telemetry-label">Free Energy</div>
+                        <div id="telemetry-fe" class="telemetry-value">0.00</div>
+                    </div>
+                    <div class="telemetry-item">
+                        <div class="telemetry-label">Motor Spikes</div>
+                        <div id="telemetry-spikes" class="telemetry-value">0</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Dashboard Content Grid -->
+        <div class="dashboard-grid">
+            <!-- Grid World -->
+            <div class="card glow-blue">
+                <div class="card-title">Grid World Navigation</div>
+                <div class="grid-container">
+                    <canvas id="grid-canvas" width="450" height="450"></canvas>
+                </div>
+            </div>
+
+            <!-- Prediction Accuracy Bar Chart -->
+            <div class="card glow-green">
+                <div class="card-title">State Prediction Error Breakdown</div>
+                <div class="chart-container">
+                    <canvas id="accuracy-chart"></canvas>
+                </div>
+            </div>
+
+            <!-- Live Spikes Raster (wide scrollable) -->
+            <div class="card span-two">
+                <div class="card-title">
+                    <span>Motor Population Spike Raster (100 Neurons)</span>
+                    <span style="font-size: 11px; font-weight: 500; color: var(--accent-blue);">Scrolling Timeline</span>
+                </div>
+                <div class="raster-container">
+                    <canvas id="raster-canvas"></canvas>
+                    <div class="raster-labels">
+                        <span>Past Activity</span>
+                        <span>Time ➔</span>
+                        <span>Now</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Free Energy Curve (wide) -->
+            <div class="card span-two">
+                <div class="card-title">Variational Free Energy Over Episode</div>
+                <div class="chart-container">
+                    <canvas id="fe-chart"></canvas>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Dashboard Logic Script -->
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+</html>

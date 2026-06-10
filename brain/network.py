@@ -41,9 +41,9 @@ class FlyBrainSNN:
         self.motor.I_inj = 0 * nA
         
         # 3. Connect populations
-        # Sensory -> Recurrent (15% connection probability, random weight)
+        # Sensory -> Recurrent (8% connection probability, random weight)
         self.S_in = Synapses(self.sensory, self.recurrent, model='w : 1', on_pre='v_post += w * mV')
-        self.S_in.connect(p=0.15)
+        self.S_in.connect(p=0.08)
         self.S_in.w = '0.5 + rand() * 1.5'  # 0.5 to 2.0 mV EPSP
         
         # Recurrent -> Recurrent (Connected via the small-world fly connectome)
@@ -52,10 +52,19 @@ class FlyBrainSNN:
         self.S_rec.connect(i=sources, j=targets)
         self.S_rec.w = weights  # Synaptic conductances scale defined in connectome loader
         
-        # Recurrent -> Motor (15% connection probability, random weight)
+        # Recurrent -> Motor (8% connection probability, random weight)
         self.S_out = Synapses(self.recurrent, self.motor, model='w : 1', on_pre='v_post += w * mV')
-        self.S_out.connect(p=0.15)
+        self.S_out.connect(p=0.08)
         self.S_out.w = '0.5 + rand() * 1.5'  # 0.5 to 2.0 mV EPSP
+        
+        # Store initial weights and set maximum weight limits to prevent saturation
+        self.S_in_initial = np.array(self.S_in.w)
+        self.S_rec_initial = np.array(self.S_rec.w)
+        self.S_out_initial = np.array(self.S_out.w)
+        
+        self.max_in_w = self.S_in_initial * 1.5
+        self.max_rec_w = self.S_rec_initial * 1.02
+        self.max_out_w = self.S_out_initial * 1.5
         
         # 4. Set up Monitors
         self.spike_mon_sensory = SpikeMonitor(self.sensory)
@@ -67,8 +76,8 @@ class FlyBrainSNN:
         # 5. Poisson Background Noise (To trigger spontaneous background firing)
         if use_noise:
             # Connect background Poisson inputs to recurrent neurons
-            # N=100 inputs, each firing at 5 Hz, each adding 1.5 mV to the membrane potential
-            self.noise = PoissonInput(self.recurrent, 'v', N=100, rate=5*Hz, weight=1.5*mV)
+            # Lowered rate and weight (Phase 3) to prevent saturation during actual steps
+            self.noise = PoissonInput(self.recurrent, 'v', N=100, rate=2*Hz, weight=1.0*mV)
         else:
             self.noise = None
             
@@ -91,24 +100,88 @@ class FlyBrainSNN:
     def inject_sensory(self, currents):
         """
         Injects sensory currents into the sensory population.
-        :param currents: 100-dimensional numpy array of current values (in nA)
+        :param currents: 100-dimensional numpy array of current values (in nA or with Brian2 units)
         """
-        self.sensory.I_inj = currents * nA
+        from brian2 import Quantity
+        if isinstance(currents, Quantity):
+            self.sensory.I_inj = currents
+        else:
+            self.sensory.I_inj = currents * nA
         
-    def get_motor_spikes_in_window(self, t_start, t_end):
+    def get_spikes_in_window(self, monitor, num_neurons, t_start, t_end):
         """
-        Calculates the spike counts of the 100 motor neurons within the given time window.
+        Calculates the spike counts of a given population within the given time window.
         """
-        times = self.spike_mon_motor.t
-        indices = self.spike_mon_motor.i
+        times = monitor.t
+        indices = monitor.i
         
         # Mask spikes within the time window
         mask = (times >= t_start) & (times <= t_end)
         recent_indices = indices[mask]
         
-        # Count occurrences for each of the 100 motor neurons
-        counts = np.bincount(recent_indices, minlength=100)
+        # Count occurrences for each neuron
+        counts = np.bincount(recent_indices, minlength=num_neurons)
         return counts
+
+    def get_motor_spikes_in_window(self, t_start, t_end):
+        """
+        Calculates the spike counts of the 100 motor neurons within the given time window.
+        """
+        return self.get_spikes_in_window(self.spike_mon_motor, 100, t_start, t_end)
+
+    def update_weights(self, free_energy, t_start, t_end, learning_rate=0.01):
+        """
+        Updates synaptic weights in the network using the FEP-modulated Hebbian learning rule.
+        """
+        from bridge.learning_rules import update_weights
+        
+        # Get spike counts for each population in the last step
+        sensory_spikes = self.get_spikes_in_window(self.spike_mon_sensory, 100, t_start, t_end)
+        recurrent_spikes = self.get_spikes_in_window(self.spike_mon_recurrent, 800, t_start, t_end)
+        motor_spikes = self.get_spikes_in_window(self.spike_mon_motor, 100, t_start, t_end)
+        
+        print(f"  [Learning] Spikes - Sensory: {np.sum(sensory_spikes)} | Recurrent: {np.sum(recurrent_spikes)} | Motor: {np.sum(motor_spikes)}")
+        print(f"  [Learning] S_in.w mean: {np.mean(self.S_in.w):.4f} | S_rec.w mean: {np.mean(self.S_rec.w):.4f} | S_out.w mean: {np.mean(self.S_out.w):.4f}")
+        
+        # 1. Update Sensory -> Recurrent weights
+        pre_in = sensory_spikes[self.S_in.i]
+        post_in = recurrent_spikes[self.S_in.j]
+        self.S_in.w = update_weights(pre_in, post_in, self.S_in.w, free_energy, learning_rate, max_weight=self.max_in_w)
+        
+        # 2. Update Recurrent -> Recurrent weights
+        # pre_rec = recurrent_spikes[self.S_rec.i]
+        # post_rec = recurrent_spikes[self.S_rec.j]
+        # self.S_rec.w = update_weights(pre_rec, post_rec, self.S_rec.w, free_energy, learning_rate, max_weight=self.max_rec_w)
+        
+        # 3. Update Recurrent -> Motor weights
+        pre_out = recurrent_spikes[self.S_out.i]
+        post_out = motor_spikes[self.S_out.j]
+        self.S_out.w = update_weights(pre_out, post_out, self.S_out.w, free_energy, learning_rate, max_weight=self.max_out_w)
+        print(f"  [Learning] Updated means - S_in.w: {np.mean(self.S_in.w):.4f} | S_rec.w: {np.mean(self.S_rec.w):.4f} | S_out.w: {np.mean(self.S_out.w):.4f}")
+
+    def reset_monitors(self):
+        """
+        Recreates and adds monitors to clear accumulated spike/state histories.
+        This speeds up simulations significantly by preventing memory and search overhead growth.
+        """
+        # 1. Remove old monitors from the network
+        self.net.remove(self.spike_mon_sensory)
+        self.net.remove(self.spike_mon_recurrent)
+        self.net.remove(self.spike_mon_motor)
+        self.net.remove(self.state_mon_rec)
+        
+        # 2. Re-create monitors
+        self.spike_mon_sensory = SpikeMonitor(self.sensory)
+        self.spike_mon_recurrent = SpikeMonitor(self.recurrent)
+        self.spike_mon_motor = SpikeMonitor(self.motor)
+        self.state_mon_rec = StateMonitor(self.recurrent, 'v', record=[0, 1, 2])
+        
+        # 3. Add them back to the network
+        self.net.add(self.spike_mon_sensory)
+        self.net.add(self.spike_mon_recurrent)
+        self.net.add(self.spike_mon_motor)
+        self.net.add(self.state_mon_rec)
+
 
 def plot_spontaneous_activity(brain, duration=200*ms):
     """

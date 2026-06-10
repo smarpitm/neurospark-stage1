@@ -29,9 +29,19 @@ class GridWorld:
 
     def get_actions(self):
         """
-        Returns list of valid actions.
+        Returns list of valid actions that do not result in boundary collisions.
         """
-        return [self.UP, self.DOWN, self.LEFT, self.RIGHT]
+        valid_actions = []
+        ax, ay = self.agent_pos
+        if ay > 0:
+            valid_actions.append(self.UP)
+        if ay < self.grid_size - 1:
+            valid_actions.append(self.DOWN)
+        if ax > 0:
+            valid_actions.append(self.LEFT)
+        if ax < self.grid_size - 1:
+            valid_actions.append(self.RIGHT)
+        return valid_actions
 
     def get_observation(self):
         """

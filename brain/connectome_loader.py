@@ -82,9 +82,9 @@ def load_or_generate_connectome(data_dir="data", filename="flywire_subset_1k.npz
     n_edges = len(sources)
     raw_weights = np.random.lognormal(mean=0.0, sigma=0.5, size=n_edges)
     
-    # Scale weights so they represent reasonable synaptic conductances (around 0.05 to 1.5 mV change post-synaptically)
-    # The average sum of input weights per neuron is normalized to ~15.0 (dimensionless weight)
-    weights = raw_weights * (15.0 / k_degree)
+    # Scale weights so they represent reasonable synaptic conductances (around 0.02 to 0.5 mV change post-synaptically)
+    # The average sum of input weights per neuron is normalized to ~5.0 (dimensionless weight) to prevent runaway recurrent excitation
+    weights = raw_weights * (5.0 / k_degree)
     
     np.savez(filepath, sources=sources, targets=targets, weights=weights)
     print(f"Generated synthetic small-world connectome and cached to: {filepath}")
