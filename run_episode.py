@@ -1,7 +1,7 @@
 import os
 import sys
 import numpy as np
-from brian2 import ms
+from brian2 import ms, nA
 
 from environment.grid_world import GridWorld
 from brain.network import FlyBrainSNN
@@ -9,7 +9,7 @@ from bridge.encoder import Encoder
 from bridge.decoder import Decoder
 from inference.generative_model import GenerativeModel
 from inference.active_inference import select_action, SIMULATION_MS, ACTION_NAMES
-from inference.free_energy import compute_free_energy, annealed_reward_weight
+from inference.free_energy import compute_free_energy, annealed_reward_weight, annealed_epsilon
 
 TRAINED_WEIGHTS_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "data", "trained_weights.npz"
@@ -20,8 +20,8 @@ def _require_weights():
     """Abort with a clear message if trained_weights.npz does not exist."""
     if not os.path.exists(TRAINED_WEIGHTS_PATH):
         print(
-            "[Error] No trained weights found. "
-            "Run train.py first to initialize."
+            "[Error] No trained weights found.\n"
+            "Run 'python train.py --bootstrap' first to create initial weights."
         )
         sys.exit(1)
 
@@ -30,7 +30,7 @@ def load_components_from_weights(weights_path=None):
     """
     Instantiate SNN, Encoder, Decoder, GenerativeModel and restore all weights
     from the trained_weights.npz checkpoint.  Raises FileNotFoundError if the
-    file is missing — callers are expected to call _require_weights() first.
+    file is missing - callers are expected to call _require_weights() first.
 
     The saved weight arrays encode the exact number of synapses per group.
     We read those shapes first and tell FlyBrainSNN to create matching
@@ -96,7 +96,7 @@ def run_episode(
 
     Components (snn, encoder, decoder, gen_model) MUST be pre-loaded with trained
     weights before calling this function.  If all four are None a convenience load
-    is attempted, but trained_weights.npz must exist — random init is never used.
+    is attempted, but trained_weights.npz must exist - random init is never used.
     """
     # ── Weights guard ────────────────────────────────────────────────────────
     all_none = (snn is None and encoder is None and decoder is None and gen_model is None)
@@ -104,7 +104,7 @@ def run_episode(
         _require_weights()                          # exits with code 1 if missing
         snn, encoder, decoder, gen_model = load_components_from_weights()
     elif any(c is None for c in (snn, encoder, decoder, gen_model)):
-        # Partial construction — caller must supply all four or none.
+        # Partial construction - caller must supply all four or none.
         raise ValueError(
             "run_episode requires all of snn, encoder, decoder, gen_model to be "
             "provided together. Pass all four or none (to auto-load from weights)."
@@ -115,16 +115,19 @@ def run_episode(
 
     free_energy_history = []
     trajectory = []
+    full_trajectory_data = []
     done = False
 
-    # Compute annealed reward weight once per episode so all steps share the same schedule value
+    # Compute annealed reward weight and epsilon once per episode
     reward_weight = annealed_reward_weight(episode)
+    epsilon = annealed_epsilon(episode)
 
     snn.reset_episode_diagnostics()
 
     if verbose:
         print(f"--- Starting Episode at Agent Position: {env.agent_pos} | Goal: {env.goal_pos} ---")
         print(f"    reward_weight (annealed, ep={episode}): {reward_weight:.3f}")
+        print(f"    epsilon       (annealed, ep={episode}): {epsilon:.3f}")
 
     motor_collapse = False
     for step in range(max_steps):
@@ -137,7 +140,7 @@ def run_episode(
         # Active Inference imagines outcomes to pick the action that minimizes Expected Free Energy (EFE)
         action, plan_info = select_action(
             snn, state, env.get_actions(), encoder, decoder, gen_model,
-            reward_weight=reward_weight, verbose=verbose
+            reward_weight=reward_weight, verbose=verbose, epsilon=epsilon
         )
 
         next_state, reward, done = env.step(action)
@@ -166,6 +169,12 @@ def run_episode(
         decoder.update(motor_spikes, next_state, reward, learning_rate=learning_rate)
         decoder.update_action_weights(motor_spikes, action, fe, learning_rate=learning_rate)
         decoder.update_forward(state, action, next_state, reward, learning_rate=learning_rate)
+
+        if (step + 1) % 10 == 0:
+            stats = snn.get_weight_stats()
+            saturated = [f"{layer}: {s['pct_saturated']*100:.1f}%" for layer, s in stats.items() if s['pct_saturated'] > 0.20]
+            if saturated and verbose:
+                print(f"  [WeightStats] Saturated weights at step {step+1}: {', '.join(saturated)}")
 
         pos_after = env.agent_pos
         motor_total = motor_diag['motor_total']
@@ -202,6 +211,14 @@ def run_episode(
 
         if on_step:
             on_step(step_data)
+            
+        full_trajectory_data.append({
+            'step': step_data['step'],
+            'pos': step_data['pos_before'],
+            'action': step_data['action_name'],
+            'reward': step_data['reward'],
+            'fe': step_data['free_energy']
+        })
 
         if verbose:
             print(
@@ -221,6 +238,26 @@ def run_episode(
         print("Episode aborted: motor collapse.")
     elif not done and verbose:
         print("Episode finished without reaching the goal (max steps exceeded).")
+
+    import json
+    traj_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "trajectories")
+    os.makedirs(traj_dir, exist_ok=True)
+    traj_path = os.path.join(traj_dir, f"episode_{episode}.json")
+    with open(traj_path, 'w') as f:
+        json.dump(full_trajectory_data, f)
+
+    fb_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "episode_feedback")
+    os.makedirs(fb_dir, exist_ok=True)
+    fb_path = os.path.join(fb_dir, f"feedback_ep{episode}.json")
+    feedback = {
+        'episode': int(episode),
+        'steps': len(full_trajectory_data),
+        'total_reward': float(sum(d['reward'] for d in full_trajectory_data)),
+        'avg_free_energy': float(np.mean(free_energy_history)) if free_energy_history else 0.0,
+        'goal_reached': bool(done)
+    }
+    with open(fb_path, 'w') as f:
+        json.dump(feedback, f, indent=4)
 
     return trajectory, free_energy_history, done
 

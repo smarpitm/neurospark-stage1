@@ -121,9 +121,16 @@
         </div>
 
         <!-- Dashboard Content Grid -->
+        <div style="margin-bottom: 20px;" class="tab-nav">
+            <button class="tab-btn active" data-view="live">Live Dashboard</button>
+            <button class="tab-btn" data-view="weights">Weight Distribution</button>
+            <button class="tab-btn" data-view="replay">Episode Replay</button>
+            <button class="tab-btn" data-view="feedback">Training Feedback</button>
+        </div>
+
         <div class="dashboard-grid">
             <!-- Grid World -->
-            <div class="card glow-blue">
+            <div class="card glow-blue view-live view-replay">
                 <div class="card-title">Grid World Navigation</div>
                 <div class="grid-container">
                     <canvas id="grid-canvas" width="450" height="450"></canvas>
@@ -131,7 +138,7 @@
             </div>
 
             <!-- Prediction Accuracy Bar Chart -->
-            <div class="card glow-green">
+            <div class="card glow-green view-live">
                 <div class="card-title">State Prediction Error Breakdown</div>
                 <div class="chart-container">
                     <canvas id="accuracy-chart"></canvas>
@@ -139,7 +146,7 @@
             </div>
 
             <!-- Live Spikes Raster (wide scrollable) -->
-            <div class="card span-two">
+            <div class="card span-two view-live">
                 <div class="card-title">
                     <span>Motor Population Spike Raster (100 Neurons)</span>
                     <span style="font-size: 11px; font-weight: 500; color: var(--accent-blue);">Scrolling Timeline</span>
@@ -155,10 +162,60 @@
             </div>
 
             <!-- Free Energy Curve (wide) -->
-            <div class="card span-two">
+            <div class="card span-two view-live">
                 <div class="card-title">Variational Free Energy Over Episode</div>
                 <div class="chart-container">
                     <canvas id="fe-chart"></canvas>
+                </div>
+            </div>
+
+            <!-- Weight Distribution Charts -->
+            <div class="card view-weights" style="display:none;">
+                <div class="card-title">Sensory → Recurrent (S_in)</div>
+                <div class="chart-container"><canvas id="w-in-chart"></canvas></div>
+            </div>
+            <div class="card view-weights" style="display:none;">
+                <div class="card-title">Recurrent → Recurrent (S_rec)</div>
+                <div class="chart-container"><canvas id="w-rec-chart"></canvas></div>
+            </div>
+            <div class="card view-weights" style="display:none;">
+                <div class="card-title">Recurrent → Motor (S_out)</div>
+                <div class="chart-container"><canvas id="w-out-chart"></canvas></div>
+            </div>
+            <div class="card view-weights" style="display:none;">
+                <div class="card-title">Sensory → Motor (S_direct)</div>
+                <div class="chart-container"><canvas id="w-direct-chart"></canvas></div>
+            </div>
+
+            <!-- Replay Controls -->
+            <div class="card glow-purple view-replay" style="display:none;">
+                <div class="card-title">Replay Controls</div>
+                <div style="display: flex; gap: 15px; align-items: center; margin-top: 20px;">
+                    <label style="font-size: 14px;">Episode ID:</label>
+                    <input type="number" id="replay-ep-id" value="1" style="background: rgba(255,255,255,0.1); border: 1px solid var(--border-color); color: white; padding: 6px 12px; border-radius: 6px; width: 80px;">
+                    <button id="btn-replay-play" class="btn btn-primary" style="padding: 6px 16px;">▶ Play Replay</button>
+                </div>
+                <div id="replay-status" style="margin-top: 15px; font-size: 13px; color: var(--text-muted);">Ready to load trajectory.</div>
+            </div>
+
+            <!-- Training Feedback -->
+            <div class="card span-two view-feedback" style="display:none;">
+                <div class="card-title">Training Episode Feedback</div>
+                <div class="table-container" style="max-height: 500px; overflow-y: auto; margin-top: 10px;">
+                    <table id="feedback-table" style="width: 100%; border-collapse: collapse; text-align: left; font-size: 14px;">
+                        <thead style="position: sticky; top: 0; background: var(--bg-card); z-index: 1;">
+                            <tr style="border-bottom: 1px solid var(--border-color); color: var(--text-muted);">
+                                <th style="padding: 10px;">Episode</th>
+                                <th style="padding: 10px;">Steps</th>
+                                <th style="padding: 10px;">Total Reward</th>
+                                <th style="padding: 10px;">Avg Free Energy</th>
+                                <th style="padding: 10px;">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="feedback-tbody">
+                            <tr><td colspan="5" style="padding: 10px; text-align: center; color: var(--text-muted);">Loading feedback...</td></tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </div>

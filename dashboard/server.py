@@ -9,8 +9,9 @@ import threading
 import time
 
 import numpy as np
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, jsonify
 from flask_socketio import SocketIO, emit
+from brian2 import ms
 
 from brain.network import FlyBrainSNN
 from bridge.encoder import Encoder
@@ -369,6 +370,32 @@ def _run_episodes(episodes, grid_size, goal_pos, max_steps, learning_rate=0.01):
 @app.route('/')
 def index():
     return render_template_string(DASHBOARD_HTML)
+
+@app.route('/api/spike_raster')
+def spike_raster():
+    with _session_lock:
+        snn = _agent['snn']
+        if snn is None:
+            return jsonify([])
+        
+        t_end_val = snn.net.t / ms
+        t_start_val = max(0.0, t_end_val - 50.0)
+        
+        def get_spikes(mon, layer_name, index_offset=0):
+            t_vals = mon.t / ms
+            i_vals = mon.i
+            mask = (t_vals >= t_start_val) & (t_vals <= t_end_val)
+            return {
+                't': t_vals[mask].tolist(),
+                'i': (i_vals[mask] + index_offset).tolist(),
+                'layer': layer_name
+            }
+            
+        sensory = get_spikes(snn.spike_mon_sensory, 'sensory', 0)
+        recurrent = get_spikes(snn.spike_mon_recurrent, 'recurrent', 100)
+        motor = get_spikes(snn.spike_mon_motor, 'motor', 900)
+        
+        return jsonify([sensory, recurrent, motor])
 
 
 @socketio.on('connect')

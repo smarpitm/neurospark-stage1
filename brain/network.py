@@ -117,6 +117,7 @@ class FlyBrainSNN:
         self._motor_low_firing_streak = 0
         self._motor_episode_steps = 0
         self._motor_collapse = False
+        self._collapse_strikes = 0
 
     @staticmethod
     def _connect_n(synapse_group, n_pre, n_post, n_connections):
@@ -177,6 +178,7 @@ class FlyBrainSNN:
         self._motor_low_firing_streak = 0
         self._motor_episode_steps = 0
         self._motor_collapse = False
+        self._collapse_strikes = 0
 
     def _inject_motor_boost(self, boost_current=0.5 * nA, num_neurons=20, duration=10 * ms):
         """Inject a brief current pulse into random motor neurons to kickstart activity."""
@@ -220,14 +222,24 @@ class FlyBrainSNN:
         else:
             self._motor_low_firing_streak = 0
 
-        motor_collapse = self._motor_low_firing_streak >= 3
-        if motor_collapse:
-            self._motor_collapse = True
-            print(
-                "[MotorCollapse] motor collapse — running average firing rate below 5% "
-                f"for {self._motor_low_firing_streak} consecutive steps "
-                f"(avg={self._motor_firing_running_avg:.1f}%)"
-            )
+        motor_collapse = False
+        if self._motor_low_firing_streak >= 3:
+            self._collapse_strikes += 1
+            if self._collapse_strikes == 1:
+                print(f"[MotorCollapse] strike 1 — running avg below 5% (avg={self._motor_firing_running_avg:.1f}%). Boosting 30 neurons.")
+                self._inject_motor_boost(boost_current=1.5 * nA, num_neurons=30, duration=20 * ms)
+                self._motor_low_firing_streak = 0
+            elif self._collapse_strikes == 2:
+                print(f"[MotorCollapse] strike 2 — running avg below 5% (avg={self._motor_firing_running_avg:.1f}%). Boosting 50 neurons.")
+                self._inject_motor_boost(boost_current=2.0 * nA, num_neurons=50, duration=30 * ms)
+                self._motor_low_firing_streak = self._motor_low_firing_streak // 2
+            else:
+                self._motor_collapse = True
+                motor_collapse = True
+                print(
+                    "[MotorCollapse] strike 3 — motor collapse, aborting "
+                    f"(avg={self._motor_firing_running_avg:.1f}%)"
+                )
 
         return {
             'motor_spikes': motor_spikes,
@@ -262,11 +274,41 @@ class FlyBrainSNN:
         post_out = motor_spikes[self.S_out.j]
         self.S_out.w = update_weights(pre_out, post_out, self.S_out.w, free_energy, learning_rate, max_weight=self.max_out_w)
 
+        self.S_rec.w = np.clip(np.array(self.S_rec.w), 0, np.array(self.max_rec_w))
+
         if verbose:
             print(
                 f"  [Learning] Sensory: {np.sum(sensory_spikes)} | "
                 f"Recurrent: {np.sum(recurrent_spikes)} | Motor: {np.sum(motor_spikes)}"
             )
+
+    def get_weight_stats(self):
+        """Returns stats on the synaptic weights, including the percentage of weights within 5% of their cap."""
+        layers = {
+            'S_in': (self.S_in.w, self.max_in_w),
+            'S_rec': (self.S_rec.w, self.max_rec_w),
+            'S_out': (self.S_out.w, self.max_out_w),
+            'S_direct': (self.S_direct.w, self.max_direct_w),
+        }
+        stats = {}
+        for name, (w, max_w) in layers.items():
+            w_arr = np.array(w)
+            max_w_arr = np.array(max_w)
+            
+            if len(w_arr) > 0:
+                threshold = 0.95 * max_w_arr
+                pct_saturated = float(np.sum(w_arr >= threshold) / len(w_arr))
+                stats[name] = {
+                    'mean': float(np.mean(w_arr)),
+                    'std': float(np.std(w_arr)),
+                    'max': float(np.max(w_arr)),
+                    'pct_saturated': pct_saturated
+                }
+            else:
+                stats[name] = {
+                    'mean': 0.0, 'std': 0.0, 'max': 0.0, 'pct_saturated': 0.0
+                }
+        return stats
 
     def reset_monitors(self):
         """

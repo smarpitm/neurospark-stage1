@@ -9,6 +9,7 @@ import numpy as np
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from flask import Flask, render_template, jsonify, request
+import json
 from flask_socketio import SocketIO, emit
 
 from brian2 import ms
@@ -19,6 +20,7 @@ from bridge.decoder import Decoder
 from inference.generative_model import GenerativeModel
 from inference.active_inference import select_action
 from inference.free_energy import compute_free_energy
+from run_episode import load_components_from_weights
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'neurospark_dashboard_secret_key'
@@ -44,35 +46,14 @@ def load_or_init_components():
 
     if not os.path.exists(weights_path):
         print(
-            "[Error] No trained weights found. "
-            "Run train.py first to initialize."
+            "[Error] No trained weights found.\n"
+            "Run 'python train.py --bootstrap' first to create initial weights."
         )
         return False
 
-    # 1. Initialize models
-    snn = FlyBrainSNN(use_noise=True)
-    encoder = Encoder()
-    decoder = Decoder()
-    gen_model = GenerativeModel()
-    
-    # 2. Load weights — no random fallback
     try:
         print(f"Loading trained weights from: {weights_path}")
-        data = np.load(weights_path)
-        snn.S_in.w  = data['S_in_w']
-        snn.S_rec.w = data['S_rec_w']
-        snn.S_out.w = data['S_out_w']
-        if 'S_direct_w' in data:
-            snn.S_direct.w = data['S_direct_w']
-        decoder.W_out    = data['decoder_W_out']
-        decoder.W_reward = data['decoder_W_reward']
-        decoder.W_action = data['decoder_W_action']
-        if 'decoder_W_forward' in data:
-            decoder.W_forward = data['decoder_W_forward']
-        if 'decoder_W_reward_forward' in data:
-            decoder.W_reward_forward = data['decoder_W_reward_forward']
-        encoder.W           = data['encoder_W']
-        encoder.W_intention = data['encoder_W_intention']
+        snn, encoder, decoder, gen_model = load_components_from_weights(weights_path)
         print("Successfully loaded trained weights!")
         return True
     except Exception as e:
@@ -98,6 +79,45 @@ def get_status():
         'weights_loaded': os.path.exists(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'trained_weights.npz')))
     })
 
+@app.route('/api/weight_distributions', methods=['GET'])
+def weight_distributions():
+    global snn
+    if snn is None:
+        return jsonify({'error': 'SNN not initialized'}), 400
+    return jsonify(snn.get_weight_stats())
+
+@app.route('/api/replay/<episode_id>', methods=['GET'])
+def get_replay(episode_id):
+    path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'trajectories', f'episode_{episode_id}.json'))
+    if not os.path.exists(path):
+        return jsonify({'error': 'Episode not found'}), 404
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/feedback', methods=['GET'])
+def get_feedback():
+    fb_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'data', 'episode_feedback'))
+    if not os.path.exists(fb_dir):
+        return jsonify([])
+    
+    import glob
+    files = glob.glob(os.path.join(fb_dir, 'feedback_ep*.json'))
+    feedback_list = []
+    for file in files:
+        try:
+            with open(file, 'r') as f:
+                data = json.load(f)
+                feedback_list.append(data)
+        except Exception:
+            pass
+            
+    feedback_list.sort(key=lambda x: x.get('episode', 0), reverse=True)
+    return jsonify(feedback_list)
+
 def simulation_worker():
     global sim_running, sim_paused, sim_delay, train_mode
     global snn, encoder, decoder, gen_model
@@ -114,19 +134,19 @@ def simulation_worker():
     action_names = {0: 'UP', 1: 'DOWN', 2: 'LEFT', 3: 'RIGHT'}
     step = 0
     max_steps = 150
-    trajectory = [list(env.agent_pos)]
+    trajectory = [[int(x) for x in env.agent_pos]]
     
     # Emit initial state
     socketio.emit('sim_step', {
         'step': 0,
-        'agent_pos': list(env.agent_pos),
-        'goal_pos': list(env.goal_pos),
+        'agent_pos': [int(x) for x in env.agent_pos],
+        'goal_pos': [int(x) for x in env.goal_pos],
         'action': 'START',
         'reward': 0.0,
         'free_energy': 0.0,
         'spikes': [0] * 100,
         'pred_state': [0.0] * 11,
-        'act_state': list(state),
+        'act_state': [float(x) for x in state],
         'trajectory': trajectory,
         'done': False
     })
@@ -145,7 +165,7 @@ def simulation_worker():
         
         # 2. Execute step
         next_state, reward, done = env.step(action)
-        trajectory.append(list(env.agent_pos))
+        trajectory.append([int(x) for x in env.agent_pos])
         
         # 3. Simulate SNN response to the chosen intention
         intention = encoder.encode_intention(state, action)
@@ -157,7 +177,26 @@ def simulation_worker():
         
         # 4. Extract motor spikes and decode predictions
         motor_spikes = snn.get_motor_spikes_in_window(t_start, t_end)
-        predicted_next, predicted_reward = decoder.decode(motor_spikes)
+        predicted_next, predicted_reward = decoder.decode(motor_spikes, current_state=state)
+        
+        # Extract 50ms spike raster
+        def get_spikes(mon, layer_name, index_offset=0):
+            t_vals = mon.t / ms
+            i_vals = mon.i
+            t_win_start = (t_end - 50 * ms) / ms
+            t_win_end = t_end / ms
+            mask = (t_vals >= t_win_start) & (t_vals <= t_win_end)
+            return {
+                't': t_vals[mask].tolist(),
+                'i': (i_vals[mask] + index_offset).tolist(),
+                'layer': layer_name
+            }
+        
+        sensory = get_spikes(snn.spike_mon_sensory, 'sensory', 0)
+        recurrent = get_spikes(snn.spike_mon_recurrent, 'recurrent', 100)
+        motor = get_spikes(snn.spike_mon_motor, 'motor', 900)
+        
+        socketio.emit('spike_raster', [sensory, recurrent, motor])
         
         # 5. Compute Prediction Error (Free Energy)
         fe = compute_free_energy(predicted_next, next_state, predicted_reward, reward)
@@ -171,14 +210,14 @@ def simulation_worker():
         # Send data to dashboard frontend
         socketio.emit('sim_step', {
             'step': step,
-            'agent_pos': list(env.agent_pos),
-            'goal_pos': list(env.goal_pos),
+            'agent_pos': [int(x) for x in env.agent_pos],
+            'goal_pos': [int(x) for x in env.goal_pos],
             'action': action_names[action],
-            'reward': reward,
+            'reward': float(reward),
             'free_energy': float(fe),
             'spikes': motor_spikes.tolist(),
             'pred_state': predicted_next.tolist(),
-            'act_state': next_state.tolist(),
+            'act_state': [float(x) for x in next_state],
             'trajectory': trajectory,
             'done': done
         })

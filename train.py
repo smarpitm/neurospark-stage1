@@ -1,5 +1,5 @@
 """
-train.py — SNN training entry-point.
+train.py - SNN training entry-point.
 
 Usage
 -----
@@ -9,7 +9,7 @@ First-ever run (creates weights from scratch):
 Continue training from existing weights:
     python train.py
 
-The agent only gets better — weights are never reset between runs.
+The agent only gets better - weights are never reset between runs.
 """
 
 import argparse
@@ -29,13 +29,16 @@ from run_episode import run_episode, TRAINED_WEIGHTS_PATH
 DATA_DIR                = "data"
 PRETRAINED_DECODER_PATH = os.path.join(DATA_DIR, "pretrained_decoder.npz")
 BEST_5X5_WEIGHTS_PATH   = os.path.join(DATA_DIR, "best_5x5_weights.npz")
+BEST_7X7_WEIGHTS_PATH   = os.path.join(DATA_DIR, "best_7x7_weights.npz")
 CONVERGED_WEIGHTS_PATH  = os.path.join(DATA_DIR, "converged_weights.npz")
 TRAINING_META_PATH      = os.path.join(DATA_DIR, "training_meta.json")
 
 # ── Curriculum constants ───────────────────────────────────────────────────────
-STAGE1_EPISODES   = 50
+STAGE1_EPISODES   = 30
+BRIDGE_EPISODES   = 20
 STAGE2_EPISODES   = 50
 STAGE1_MAX_STEPS  = 50
+BRIDGE_MAX_STEPS  = 75
 STAGE2_MAX_STEPS  = 100
 CONVERGE_MAX_STEPS = 30
 CONVERGE_STREAK    = 5
@@ -114,7 +117,7 @@ def pretrain_forward_model(
     verbose=True,
 ):
     """
-    Collect random-action transitions in a 5×5 grid and train the decoder's
+    Collect random-action transitions in a 5x5 grid and train the decoder's
     forward model (W_forward, W_reward_forward) with supervised MSE learning
     before active inference begins.
     """
@@ -126,7 +129,7 @@ def pretrain_forward_model(
 
     if verbose:
         print(f"\n[Pretraining] Collecting {num_random_steps} random transitions "
-              f"in {grid_size}×{grid_size} grid …")
+              f"in {grid_size}x{grid_size} grid ...")
 
     for _ in range(num_random_steps):
         actions = env.get_actions()
@@ -139,7 +142,7 @@ def pretrain_forward_model(
 
     if verbose:
         print(f"[Pretraining] Buffer size: {len(buffer)} transitions. "
-              f"Running {sgd_epochs} SGD epochs …")
+              f"Running {sgd_epochs} SGD epochs ...")
 
     for epoch in range(sgd_epochs):
         np.random.shuffle(buffer)
@@ -163,7 +166,7 @@ def pretrain_forward_model(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Bootstrap — first-ever weight creation
+# Bootstrap - first-ever weight creation
 # ──────────────────────────────────────────────────────────────────────────────
 
 def bootstrap():
@@ -179,7 +182,7 @@ def bootstrap():
         )
         sys.exit(1)
 
-    print("[Bootstrap] No existing weights found — initialising from scratch …")
+    print("[Bootstrap] No existing weights found - initialising from scratch ...")
     os.makedirs(DATA_DIR, exist_ok=True)
 
     snn     = FlyBrainSNN(use_noise=True)
@@ -210,20 +213,22 @@ def bootstrap():
 
 def train(
     stage1_episodes=STAGE1_EPISODES,
+    bridge_episodes=BRIDGE_EPISODES,
     stage2_episodes=STAGE2_EPISODES,
     stage1_max_steps=STAGE1_MAX_STEPS,
+    bridge_max_steps=BRIDGE_MAX_STEPS,
     stage2_max_steps=STAGE2_MAX_STEPS,
     learning_rate=0.01,
 ):
     """
     Continue training from existing weights.  Refuses to run if
-    trained_weights.npz is missing — use --bootstrap first.
+    trained_weights.npz is missing - use --bootstrap first.
     """
     # ── Guard: weights must exist ────────────────────────────────────────────
     if not os.path.exists(TRAINED_WEIGHTS_PATH):
         print(
-            "[Error] No trained weights found. "
-            "Run train.py first to initialize."
+            "[Error] No trained weights found.\n"
+            "Run 'python train.py --bootstrap' first to create initial weights."
         )
         sys.exit(1)
 
@@ -233,18 +238,19 @@ def train(
     best_steps_ever       = meta.get('best_steps', None)
     last_steps            = meta.get('last_steps', None)
 
-    best_str = f"{best_steps_ever}" if best_steps_ever is not None else "—"
-    last_str = f"{last_steps}"      if last_steps      is not None else "—"
+    best_str = f"{best_steps_ever}" if best_steps_ever is not None else "-"
+    last_str = f"{last_steps}"      if last_steps      is not None else "-"
     print(
         f"[Loaded] Episode {total_episodes_so_far} | "
         f"Best: {best_str} steps | Last: {last_str} steps"
     )
 
-    total_episodes = stage1_episodes + stage2_episodes
+    total_episodes = stage1_episodes + bridge_episodes + stage2_episodes
     print("==========================================")
     print(
-        f"Starting SNN Training — {stage1_episodes}×5×5 (max {stage1_max_steps} steps) "
-        f"+ {stage2_episodes}×10×10 (max {stage2_max_steps} steps)"
+        f"Starting SNN Training - {stage1_episodes}x5x5 (max {stage1_max_steps} steps) "
+        f"+ {bridge_episodes}x7x7 (max {bridge_max_steps} steps) "
+        f"+ {stage2_episodes}x10x10 (max {stage2_max_steps} steps)"
     )
     print("==========================================\n")
 
@@ -261,7 +267,7 @@ def train(
     os.makedirs(DATA_DIR, exist_ok=True)
     if os.path.exists(PRETRAINED_DECODER_PATH):
         decoder.load(PRETRAINED_DECODER_PATH)
-        print("[Pretraining] Pretrained decoder loaded — skipping random exploration.\n")
+        print("[Pretraining] Pretrained decoder loaded - skipping random exploration.\n")
     else:
         pretrain_forward_model(
             decoder, encoder,
@@ -276,12 +282,16 @@ def train(
     avg_fe_history   = []
     best_5x5_steps   = float('inf')
     best_5x5_episode = None
+    best_7x7_steps   = float('inf')
+    best_7x7_episode = None
     fast_goal_streak = 0
     converged        = False
     global_episode   = total_episodes_so_far  # continues from last saved episode
 
     if os.path.exists(BEST_5X5_WEIGHTS_PATH):
         os.remove(BEST_5X5_WEIGHTS_PATH)
+    if os.path.exists(BEST_7X7_WEIGHTS_PATH):
+        os.remove(BEST_7X7_WEIGHTS_PATH)
 
     # ── Episode runner ────────────────────────────────────────────────────────
     def run_one_episode(stage_name, grid_size, goal_pos, max_steps, ep_number):
@@ -315,7 +325,7 @@ def train(
         improved = best_steps_ever is None or steps_taken < best_steps_ever
         if improved:
             best_steps_ever = steps_taken
-        # Always save after a successful episode — agent only gets better
+        # Always save after a successful episode - agent only gets better
         save_agent_weights(TRAINED_WEIGHTS_PATH, snn, decoder, encoder)
         meta_now = {
             'total_episodes': global_episode,
@@ -323,10 +333,10 @@ def train(
             'last_steps':     steps_taken,
         }
         _save_meta(meta_now)
-        tag = " ← new best" if improved else ""
-        print(f"[Saved] Weights updated — {steps_taken} steps{tag}")
+        tag = " <- new best" if improved else ""
+        print(f"[Saved] Weights updated - {steps_taken} steps{tag}")
 
-    # ── Stage 1: 5×5 ─────────────────────────────────────────────────────────
+    # ── Stage 1: 5x5 ─────────────────────────────────────────────────────────
     for stage_ep in range(stage1_episodes):
         global_episode += 1
         ep = global_episode
@@ -335,7 +345,7 @@ def train(
             snn.reset_monitors()
 
         print(f"\n--- Episode {ep} ({ep - total_episodes_so_far}/{total_episodes} this run) "
-              f"[5×5 Grid | Goal: (4,4)] ---")
+              f"[5x5 Grid | Goal: (4,4)] ---")
 
         steps_taken, avg_fe, reached_goal = run_one_episode(
             "5x5 Grid", grid_size=5, goal_pos=(4, 4),
@@ -351,21 +361,59 @@ def train(
             best_5x5_episode = ep
             save_agent_weights(BEST_5X5_WEIGHTS_PATH, snn, decoder, encoder)
             print(
-                f"[Checkpoint] New best 5×5 run: {steps_taken} steps "
-                f"(episode {ep}) → saved to '{BEST_5X5_WEIGHTS_PATH}'"
+                f"[Checkpoint] New best 5x5 run: {steps_taken} steps "
+                f"(episode {ep}) -> saved to '{BEST_5X5_WEIGHTS_PATH}'"
             )
 
-    # ── Transition: load best 5×5 weights for 10×10 stage ────────────────────
+    # ── Transition: load best 5x5 weights for 7x7 stage ────────────────────
     if best_5x5_episode is not None and os.path.exists(BEST_5X5_WEIGHTS_PATH):
         load_agent_weights(BEST_5X5_WEIGHTS_PATH, snn, decoder, encoder)
         print(
-            f"\n[Curriculum] Loaded best 5×5 weights ({best_5x5_steps} steps, "
-            f"episode {best_5x5_episode}) for 10×10 stage."
+            f"\n[Curriculum] Loaded best 5x5 weights ({best_5x5_steps} steps, "
+            f"episode {best_5x5_episode}) for 7x7 stage."
         )
     else:
-        print("\n[Curriculum] No successful 5×5 checkpoint — continuing to 10×10 with current weights.")
+        print("\n[Curriculum] No successful 5x5 checkpoint - continuing to 7x7 with current weights.")
 
-    # ── Stage 2: 10×10 ───────────────────────────────────────────────────────
+    # ── Bridge Stage: 7x7 ───────────────────────────────────────────────────────
+    for stage_ep in range(bridge_episodes):
+        global_episode += 1
+        ep = global_episode
+
+        snn.reset_monitors()
+
+        print(f"\n--- Episode {ep} ({ep - total_episodes_so_far}/{total_episodes} this run) "
+              f"[7x7 Grid | Goal: (6,6)] ---")
+
+        steps_taken, avg_fe, reached_goal = run_one_episode(
+            "7x7 Grid", grid_size=7, goal_pos=(6, 6),
+            max_steps=bridge_max_steps, ep_number=ep,
+        )
+        steps_history.append(steps_taken)
+        avg_fe_history.append(avg_fe)
+
+        persist_weights_if_improved(steps_taken, reached_goal)
+
+        if reached_goal and steps_taken < best_7x7_steps:
+            best_7x7_steps   = steps_taken
+            best_7x7_episode = ep
+            save_agent_weights(BEST_7X7_WEIGHTS_PATH, snn, decoder, encoder)
+            print(
+                f"[Checkpoint] New best 7x7 run: {steps_taken} steps "
+                f"(episode {ep}) -> saved to '{BEST_7X7_WEIGHTS_PATH}'"
+            )
+
+    # ── Transition: load best 7x7 weights for 10x10 stage ────────────────────
+    if best_7x7_episode is not None and os.path.exists(BEST_7X7_WEIGHTS_PATH):
+        load_agent_weights(BEST_7X7_WEIGHTS_PATH, snn, decoder, encoder)
+        print(
+            f"\n[Curriculum] Loaded best 7x7 weights ({best_7x7_steps} steps, "
+            f"episode {best_7x7_episode}) for 10x10 stage."
+        )
+    else:
+        print("\n[Curriculum] No successful 7x7 checkpoint - continuing to 10x10 with current weights.")
+
+    # ── Stage 2: 10x10 ───────────────────────────────────────────────────────
     for stage_ep in range(stage2_episodes):
         global_episode += 1
         ep = global_episode
@@ -373,7 +421,7 @@ def train(
         snn.reset_monitors()
 
         print(f"\n--- Episode {ep} ({ep - total_episodes_so_far}/{total_episodes} this run) "
-              f"[10×10 Grid | Goal: (9,9)] ---")
+              f"[10x10 Grid | Goal: (9,9)] ---")
 
         steps_taken, avg_fe, reached_goal = run_one_episode(
             "10x10 Grid", grid_size=10, goal_pos=(9, 9),
@@ -387,7 +435,7 @@ def train(
         if reached_goal and steps_taken < CONVERGE_MAX_STEPS:
             fast_goal_streak += 1
             print(
-                f"[Convergence] Fast goal ({steps_taken} steps) — "
+                f"[Convergence] Fast goal ({steps_taken} steps) - "
                 f"streak {fast_goal_streak}/{CONVERGE_STREAK}"
             )
         else:
@@ -415,13 +463,17 @@ def train(
     episodes_run  = len(steps_history)
     episode_axis  = range(1, episodes_run + 1)
     stage1_end    = min(stage1_episodes, episodes_run)
+    bridge_end    = min(stage1_episodes + bridge_episodes, episodes_run)
 
     plt.figure(figsize=(12, 5))
 
     plt.subplot(1, 2, 1)
     plt.plot(episode_axis, steps_history, marker='o', color='#38bdf8', linewidth=2)
     if stage1_end < episodes_run:
-        plt.axvline(stage1_end + 0.5, color='#f59e0b', linestyle='--', alpha=0.8, label='5×5 → 10×10')
+        plt.axvline(stage1_end + 0.5, color='#f59e0b', linestyle='--', alpha=0.8, label='5x5 -> 7x7')
+    if bridge_end < episodes_run:
+        plt.axvline(bridge_end + 0.5, color='#ef4444', linestyle='--', alpha=0.8, label='7x7 -> 10x10')
+    if stage1_end < episodes_run or bridge_end < episodes_run:
         plt.legend(loc='upper right', facecolor='#1e293b', edgecolor='none', labelcolor='white')
     plt.title("Steps to Goal per Episode", fontsize=12, fontweight='bold', color='white')
     plt.xlabel("Episode", fontsize=10, color='white')
@@ -432,6 +484,8 @@ def train(
     plt.plot(episode_axis, avg_fe_history, marker='s', color='#10b981', linewidth=2)
     if stage1_end < episodes_run:
         plt.axvline(stage1_end + 0.5, color='#f59e0b', linestyle='--', alpha=0.8)
+    if bridge_end < episodes_run:
+        plt.axvline(bridge_end + 0.5, color='#ef4444', linestyle='--', alpha=0.8)
     plt.title("Avg Free Energy per Episode", fontsize=12, fontweight='bold', color='white')
     plt.xlabel("Episode", fontsize=10, color='white')
     plt.ylabel("Variational Free Energy", fontsize=10, color='white')
@@ -460,14 +514,19 @@ def train(
         print(f"Converged checkpoint at '{CONVERGED_WEIGHTS_PATH}'")
     if best_5x5_episode is not None:
         print(
-            f"Best 5×5 checkpoint: {best_5x5_steps} steps "
+            f"Best 5x5 checkpoint: {best_5x5_steps} steps "
             f"(episode {best_5x5_episode}) at '{BEST_5X5_WEIGHTS_PATH}'"
+        )
+    if best_7x7_episode is not None:
+        print(
+            f"Best 7x7 checkpoint: {best_7x7_steps} steps "
+            f"(episode {best_7x7_episode}) at '{BEST_7X7_WEIGHTS_PATH}'"
         )
 
     print(
         f"\nTraining complete ({episodes_run} episodes this run, "
         f"{global_episode} total). "
-        "The agent only gets better — weights saved after every successful episode."
+        "The agent only gets better - weights saved after every successful episode."
     )
 
 

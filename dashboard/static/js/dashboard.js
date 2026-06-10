@@ -55,8 +55,8 @@ window.addEventListener('resize', () => {
 });
 
 // Raster state
-let rasterBuffer = [];
-const maxRasterSteps = 100;
+let globalRasterSpikes = [];
+let latestTime = 0;
 
 // Socket connection handlers
 socket.on('connect', () => {
@@ -172,7 +172,7 @@ const accChart = new Chart(accCtx, {
 // ---------------------------------------------------------
 
 // Draw SNN Spike Raster
-function drawRaster() {
+function drawRasterAll() {
     const dpr = window.devicePixelRatio || 1;
     const w = rasterCanvas.width / dpr;
     const h = rasterCanvas.height / dpr;
@@ -182,44 +182,32 @@ function drawRaster() {
     // Draw background grids
     rasterCtx.strokeStyle = 'rgba(255, 255, 255, 0.03)';
     rasterCtx.lineWidth = 0.5;
-    for (let i = 0; i <= 100; i += 10) {
-        let y = (i / 100) * h;
+    for (let i = 0; i <= 1000; i += 100) {
+        let y = (i / 1000) * h;
         rasterCtx.beginPath();
         rasterCtx.moveTo(0, y);
         rasterCtx.lineTo(w, y);
         rasterCtx.stroke();
     }
     
-    if (rasterBuffer.length === 0) return;
+    if (globalRasterSpikes.length === 0) return;
     
-    const colWidth = w / maxRasterSteps;
-    const rowHeight = h / 100;
+    const timeWindow = 500; // 500ms
+    const startTime = Math.max(0, latestTime - timeWindow);
     
-    for (let col = 0; col < rasterBuffer.length; col++) {
-        const spikes = rasterBuffer[col];
-        const x = col * colWidth;
-        const age = (rasterBuffer.length - 1) - col;
-        const opacity = Math.max(0.12, 1 - age / maxRasterSteps);
+    for (const spike of globalRasterSpikes) {
+        const x = ((spike.t - startTime) / timeWindow) * w;
+        if (x < 0 || x > w) continue;
         
-        for (let row = 0; row < spikes.length; row++) {
-            const count = spikes[row];
-            if (count > 0) {
-                const r = Math.min(rowHeight / 2 - 0.5, 1.2 + count * 0.4);
-                const y = (99 - row) * rowHeight + (rowHeight / 2);
-                
-                // Draw glow
-                rasterCtx.fillStyle = `rgba(56, 189, 248, ${opacity * 0.45})`;
-                rasterCtx.beginPath();
-                rasterCtx.arc(x + colWidth/2, y, r * 2.2, 0, Math.PI * 2);
-                rasterCtx.fill();
-                
-                // Draw core dot
-                rasterCtx.fillStyle = `rgba(248, 250, 252, ${opacity})`;
-                rasterCtx.beginPath();
-                rasterCtx.arc(x + colWidth/2, y, r, 0, Math.PI * 2);
-                rasterCtx.fill();
-            }
-        }
+        const y = h - ((spike.i / 1000) * h);
+        
+        if (spike.layer === 'sensory') rasterCtx.fillStyle = '#38bdf8';
+        else if (spike.layer === 'recurrent') rasterCtx.fillStyle = '#c084fc';
+        else if (spike.layer === 'motor') rasterCtx.fillStyle = '#10b981';
+        
+        rasterCtx.beginPath();
+        rasterCtx.arc(x, y, 2, 0, Math.PI * 2);
+        rasterCtx.fill();
     }
 }
 
@@ -396,12 +384,8 @@ socket.on('sim_step', (data) => {
     accChart.data.datasets[1].data = data.pred_state;
     accChart.update('none');
     
-    // 4. Update Spikes Raster timeline
-    rasterBuffer.push(data.spikes);
-    if (rasterBuffer.length > maxRasterSteps) {
-        rasterBuffer.shift();
-    }
-    drawRaster();
+    // 4. Removed old raster buffer
+    // Updated by spike_raster event
     
     // 5. Update Grid World canvas
     drawGridWorld(data.agent_pos, data.goal_pos, data.trajectory, data.act_state);
@@ -474,8 +458,8 @@ btnStart.addEventListener('click', () => {
         feChart.data.labels = [];
         feChart.data.datasets[0].data = [];
         feChart.update();
-        rasterBuffer = [];
-        drawRaster();
+        globalRasterSpikes = [];
+        drawRasterAll();
     }
     socket.emit('start_sim');
 });
@@ -506,4 +490,191 @@ btnResetWeights.addEventListener('click', () => {
     if (confirm('Are you sure you want to reset the SNN network synapses and decoder maps? All training progress will be lost.')) {
         socket.emit('reset_weights');
     }
+});
+
+
+
+socket.on('spike_raster', (layers) => {
+    layers.forEach(layer => {
+        for (let idx = 0; idx < layer.t.length; idx++) {
+            let time = layer.t[idx];
+            latestTime = Math.max(latestTime, time);
+            globalRasterSpikes.push({
+                t: time,
+                i: layer.i[idx],
+                layer: layer.layer
+            });
+        }
+    });
+    
+    // Keep only last 500ms
+    globalRasterSpikes = globalRasterSpikes.filter(s => s.t >= latestTime - 500);
+    drawRasterAll();
+});
+
+// ---------------------------------------------------------
+// UI Tab Navigation
+// ---------------------------------------------------------
+document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        const view = btn.getAttribute('data-view');
+        
+        document.querySelectorAll('.card').forEach(card => {
+            if (card.className.includes('view-')) {
+                card.style.display = card.className.includes('view-' + view) ? '' : 'none';
+            }
+        });
+
+        if (view === 'weights') {
+            fetchWeightDist();
+        }
+        if (view === 'feedback') {
+            fetchFeedback();
+        }
+    });
+});
+
+// ---------------------------------------------------------
+// Weight Distribution Charts
+// ---------------------------------------------------------
+const weightCharts = {};
+
+function initWeightChart(canvasId, label, color) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return null;
+    const ctx = canvas.getContext('2d');
+    return new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: ['Mean', 'Max', '% Saturated (x100)'],
+            datasets: [{
+                label: label,
+                data: [0, 0, 0],
+                backgroundColor: color,
+                borderRadius: 4
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: {
+                y: { beginAtZero: true, grid: { color: 'rgba(255, 255, 255, 0.03)' } },
+                x: { grid: { display: false } }
+            }
+        }
+    });
+}
+
+weightCharts['S_in'] = initWeightChart('w-in-chart', 'Sensory → Recurrent', 'rgba(56, 189, 248, 0.7)');
+weightCharts['S_rec'] = initWeightChart('w-rec-chart', 'Recurrent → Recurrent', 'rgba(168, 85, 247, 0.7)');
+weightCharts['S_out'] = initWeightChart('w-out-chart', 'Recurrent → Motor', 'rgba(16, 185, 129, 0.7)');
+weightCharts['S_direct'] = initWeightChart('w-direct-chart', 'Sensory → Motor', 'rgba(251, 146, 60, 0.7)');
+
+function fetchWeightDist() {
+    fetch('/api/weight_distributions')
+        .then(res => res.json())
+        .then(data => {
+            if (data.error) {
+                console.error('Error fetching weights:', data.error);
+                return;
+            }
+            for (const layer in data) {
+                if (weightCharts[layer]) {
+                    const stats = data[layer];
+                    weightCharts[layer].data.datasets[0].data = [
+                        stats.mean,
+                        stats.max,
+                        stats.pct_saturated * 100
+                    ];
+                    weightCharts[layer].update();
+                }
+            }
+        })
+        .catch(err => console.error('Error fetching weights:', err));
+}
+
+// ---------------------------------------------------------
+// Feedback Table
+// ---------------------------------------------------------
+function fetchFeedback() {
+    fetch('/api/feedback')
+        .then(res => res.json())
+        .then(data => {
+            const tbody = document.getElementById('feedback-tbody');
+            tbody.innerHTML = '';
+            if (data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="padding: 10px; text-align: center; color: var(--text-muted);">No feedback data found yet.</td></tr>';
+                return;
+            }
+            
+            data.forEach(fb => {
+                const tr = document.createElement('tr');
+                tr.style.borderBottom = '1px solid rgba(255,255,255,0.03)';
+                
+                const statusColor = fb.goal_reached ? 'var(--accent-green)' : 'var(--accent-orange)';
+                const statusText = fb.goal_reached ? 'Goal Reached' : 'Failed';
+                
+                tr.innerHTML = `
+                    <td style="padding: 10px; color: var(--text-muted);">#${fb.episode}</td>
+                    <td style="padding: 10px; font-weight: 500;">${fb.steps}</td>
+                    <td style="padding: 10px; font-family: monospace;">${fb.total_reward.toFixed(2)}</td>
+                    <td style="padding: 10px; font-family: monospace;">${fb.avg_free_energy.toFixed(3)}</td>
+                    <td style="padding: 10px; color: ${statusColor}; font-weight: 500;">${statusText}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        })
+        .catch(err => {
+            console.error('Error fetching feedback:', err);
+            const tbody = document.getElementById('feedback-tbody');
+            tbody.innerHTML = `<tr><td colspan="5" style="padding: 10px; text-align: center; color: var(--accent-orange);">Error loading feedback.</td></tr>`;
+        });
+}
+
+// ---------------------------------------------------------
+// Episode Replay
+// ---------------------------------------------------------
+let replayInterval = null;
+
+document.getElementById('btn-replay-play')?.addEventListener('click', () => {
+    const epId = document.getElementById('replay-ep-id').value;
+    const statusEl = document.getElementById('replay-status');
+    
+    if (replayInterval) clearInterval(replayInterval);
+    
+    statusEl.textContent = 'Loading...';
+    
+    fetch(`/api/replay/${epId}`)
+        .then(res => res.json())
+        .then(data => {
+            if (data.error) {
+                statusEl.textContent = 'Error: ' + data.error;
+                return;
+            }
+            statusEl.textContent = `Playing ${data.length} steps...`;
+            
+            let stepIdx = 0;
+            const trajectorySoFar = [];
+            
+            replayInterval = setInterval(() => {
+                if (stepIdx >= data.length) {
+                    clearInterval(replayInterval);
+                    statusEl.textContent = 'Replay finished.';
+                    return;
+                }
+                
+                const stepData = data[stepIdx];
+                // Render the position on the grid canvas
+                trajectorySoFar.push(stepData.pos);
+                drawGridWorld(stepData.pos, [9, 9], trajectorySoFar, Array(11).fill(0));
+                
+                stepIdx++;
+            }, 200);
+        })
+        .catch(err => {
+            statusEl.textContent = 'Error: ' + err.message;
+        });
 });

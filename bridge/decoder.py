@@ -8,7 +8,7 @@ class Decoder:
     def __init__(self, motor_neurons=100, output_dim=11):
         self.motor_neurons = motor_neurons
         self.output_dim = output_dim
-        self.intention_dim = INPUT_DIM + NUM_ACTIONS
+        self.intention_dim = INPUT_DIM + NUM_ACTIONS + (INPUT_DIM * NUM_ACTIONS)
 
         self.W_out = np.random.randn(output_dim, motor_neurons) * 0.05
         self.W_reward = np.random.randn(motor_neurons) * 0.05
@@ -22,6 +22,9 @@ class Decoder:
         intention = np.zeros(self.intention_dim, dtype=np.float32)
         intention[:INPUT_DIM] = state
         intention[INPUT_DIM + action] = 1.0
+        
+        cross_idx = INPUT_DIM + NUM_ACTIONS + action * INPUT_DIM
+        intention[cross_idx : cross_idx + INPUT_DIM] = state
         return intention
 
     def _normalize_spikes(self, spike_counts):
@@ -42,9 +45,12 @@ class Decoder:
         """Train the forward model on observed transitions."""
         x = self._intention_vector(state, action)
         pred_state = self.predict_forward(state, action)
-        self.W_forward += learning_rate * np.outer(actual_next_state - pred_state, x)
+        
+        l2_lambda = 0.001
+        self.W_forward += learning_rate * (np.outer(actual_next_state - pred_state, x) - l2_lambda * self.W_forward)
+        
         pred_reward = self.predict_reward_forward(state, action)
-        self.W_reward_forward += learning_rate * (actual_reward - pred_reward) * x
+        self.W_reward_forward += learning_rate * ((actual_reward - pred_reward) * x - l2_lambda * self.W_reward_forward)
 
     def decode(self, spike_counts, current_state=None):
         """
